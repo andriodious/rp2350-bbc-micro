@@ -1,3 +1,6 @@
+#include "profile.h"
+#include "pixel_convert.h"
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include "pico/stdlib.h"
@@ -19,6 +22,7 @@ extern "C" {
 extern const uint8_t c64_default_disc[];
 extern const uint32_t c64_default_disc_size;
 void c64_init(void); bool c64_run_frame(void); void c64_reset(void); void c64_nmi(void);
+uint8_t *c64_exchange_framebuffer(void);
 uint8_t *c64_get_framebuffer(void); uint8_t *c64_get_ram(void);
 void c64_mount_disk(const uint8_t *,uint32_t,const char *);void c64_unmount_disk(void);
 void c64_disk_set(uint8_t *,size_t);uint32_t c64_disk_writes(void);uint32_t c64_memory_used(void);
@@ -54,6 +58,10 @@ extern "C" void c64_diagnostics_json(char *out,uint32_t size){
         recovery?"true":"false",(unsigned long)previous_phase,(unsigned long)previous_pc,(unsigned long)previous_cfsr,
         (unsigned long)to_ms_since_boot(get_absolute_time()),(unsigned long)(watchdog_hw->scratch[0]&511),
         (unsigned long)trace_frames,(unsigned long)trace_rendered);
+#if C64_PROFILE
+    size_t used = strlen(out);
+    if (used < size) c64_profile::json(out + used, size - used);
+#endif
 }
 static bool turbo, reset_pending, install_hold;
 static uint8_t keys[8],reverse_keys[8];
@@ -75,16 +83,23 @@ static unsigned speed=100, load0, load1;
 // One RGB565 row per VIC row; the LCD row table stretches 272 rows to 480.
 static uint16_t pixels[272][482] __attribute__((aligned(4)));
 static const uint16_t *rows[481];
-static volatile bool frame_ready;
+static_assert(std::atomic<bool>::is_always_lock_free, "Frame hand-off must be lock-free");
+static std::atomic<bool> frame_ready{false};
+static const uint8_t *render_source;
+static bool render_pending;
 static volatile uint32_t conversion_us;
 static const uint32_t palette[16]={0x000000,0xffffff,0x813338,0x75cec8,0x8e3c97,0x56ac4d,0x2e2c9b,0xedf171,0x8e5029,0x553800,0xc46c71,0x4a4a4a,0x7b7b7b,0xa9ff9f,0x706deb,0xb2b2b2};
 static uint16_t pin_palette[16];
 static void convert_frame(){
-    const uint8_t *src=c64_get_framebuffer();
+    const uint8_t *src=render_source;
     for(int y=0;y<272;y++)for(int group=0;group<96;group++){
         const uint8_t *in=src+y*384+group*4;uint16_t *out=pixels[y]+group*5;
+#if C64_PACKED_PIXELS
+        c64_convert_four<true>(in,out,pin_palette);
+#else
         out[0]=out[1]=pin_palette[in[0]&15];out[2]=pin_palette[in[1]&15];
         out[3]=pin_palette[in[2]&15];out[4]=pin_palette[in[3]&15];
+#endif
     }
 }
 static void core1(){
@@ -93,12 +108,12 @@ static void core1(){
     audio_init();
 #endif
     for(;;){
-        if(!frame_ready){__wfe();continue;}
+        if(!frame_ready.load(std::memory_order_acquire)){__wfe();continue;}
         __dmb();uint32_t t=time_us_32();convert_frame();trace_rendered++;conversion_us=time_us_32()-t;
 #if WITH_AMBIENT
         if(board_leds_due())board_leds_update();
 #endif
-        __dmb();frame_ready=false;__sev();
+        frame_ready.store(false,std::memory_order_release);__sev();
     }
 }
 // App installation is shared with BBC modes. Keep the last C64 picture while
@@ -140,7 +155,11 @@ extern "C" void machine_perf_get(unsigned *a,unsigned *b,unsigned *s){*a=load0;*
 extern "C" uint32_t machine_psram_used(){return c64_memory_used();}
 extern "C" unsigned machine_leds(){return 0;}
 extern "C" void machine_print_stats(){printf("STATS machine=c64 core0=%u core1=%u speed=%u%%\n",load0,load1,speed);}
-extern "C" bool machine_usb_command(const char *cmd){if(!strcmp(cmd,"restore")){c64_nmi();return true;}return false;}
+extern "C" bool machine_usb_command(const char *cmd){
+#if C64_PROFILE
+if(!strcmp(cmd,"c64prof")){c64_profile::print();return true;}
+#endif
+if(!strcmp(cmd,"restore")){c64_nmi();return true;}return false;}
 extern "C" void machine_drive_load(const uint8_t *image,uint32_t n,bool,bool boot){
     if(recovery)return;
     c64_unmount_disk();typing=nullptr;boot_frames=0;
@@ -183,26 +202,62 @@ int main(){
     uint64_t due=time_us_64(),stat=due,busy=0;unsigned frames=0;
     for(;;){
         if(install_hold){
+#if C64_PROFILE
+            c64_profile::reset();
+#endif
             frontend_frame();watchdog_update();sleep_ms(1);
             due=time_us_64();stat=due;busy=0;frames=0;
             continue;
         }
         if(reset_pending){c64_reset();reset_pending=false;memset(pressed,0,sizeof pressed);rebuild_keys();}
-        phase(4);uint64_t t=time_us_64();c64_run_frame();trace_frames++;busy+=time_us_64()-t;
+#if C64_PROFILE
+        c64_profile::begin(time_us_64(),turbo);
+#endif
+        phase(4);uint64_t t=time_us_64();
+        C64_PROFILE_CALL(EMULATION, c64_run_frame());
+        trace_frames++;busy+=time_us_64()-t;
         phase(5);
 #if WITH_AMBIENT
         board_leds_frame(0);
 #endif
         // Turbo skips alternate display conversions, giving emulation more time.
-        if(!turbo || (trace_frames&1)==0){__dmb();frame_ready=true;__sev();}
-        // Do not mutate the VIC framebuffer until core 1 has converted it.
-        while(frame_ready){frontend_poll();sleep_us(50);}
-        phase(6);frontend_frame();watchdog_update();
+        bool submitted = !turbo || (trace_frames&1)==0;
+        bool converted = false;
+#if C64_RENDER_OVERLAP
+        // Emulation has used its own writable buffer while core 1 reads the
+        // previous completed frame. Wait only before reusing that reader's buffer.
+        C64_PROFILE_CALL(WAIT, while(frame_ready.load(std::memory_order_acquire)){frontend_poll();sleep_us(50);});
+        converted=render_pending;
+#if C64_PROFILE
+        if(converted)c64_profile::add(c64_profile::CONVERSION,conversion_us);
+#endif
+        render_pending=false;
+        if(submitted){
+            render_source=c64_exchange_framebuffer();
+            render_pending=true;
+            frame_ready.store(true,std::memory_order_release);__sev();
+        }
+#else
+        if(submitted){
+            render_source=c64_get_framebuffer();
+            frame_ready.store(true,std::memory_order_release);__sev();
+        }
+        C64_PROFILE_CALL(WAIT, while(frame_ready.load(std::memory_order_acquire)){frontend_poll();sleep_us(50);});
+        converted=submitted;
+#if C64_PROFILE
+        if(converted)c64_profile::add(c64_profile::CONVERSION,conversion_us);
+#endif
+#endif
+        phase(6);C64_PROFILE_CALL(FRONTEND, frontend_frame());watchdog_update();
         if(boot_frames && !--boot_frames)typing="LOAD\"*\",8,1\rRUN\r";
         if(typing && *typing){uint8_t *ram=c64_get_ram();if(ram[198]<10){ram[631+ram[198]]= *typing++;ram[198]++;}}
         phase(7);frames++;due+=20000;
-        if(!turbo){while(time_us_64()<due){frontend_poll();sleep_us(100);}}
-        else due=time_us_64();
+        C64_PROFILE_CALL(PACING,
+            if(!turbo){while(time_us_64()<due){frontend_poll();sleep_us(100);}}
+            else due=time_us_64(););
+#if C64_PROFILE
+        if(c64_profile::finish(time_us_64(),converted))c64_profile::print();
+#endif
         if(time_us_64()-due>100000)due=time_us_64();
         uint64_t now=time_us_64();if(now-stat>=5000000){uint64_t dt=now-stat;load0=busy*100/dt;load1=conversion_us/200;speed=frames*2000000ull/dt;machine_print_stats();stat=now;busy=0;frames=0;}
     }
